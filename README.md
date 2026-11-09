@@ -1,3 +1,16 @@
+# General info
+## Data
+* You will have to download the data from the google disk manually and add it in the `data/`
+* Make you sure you separate the `tactical/` and `broadcast/`. The `games.py` expects to see at least one of them in the `data/`
+## How to run
+1. Run the model `python starter/tested_models/HMM.py *--switch-seconds <#sec> *--out <out_path>`
+2. Validate `python evaluation/validate_submission.py path/to/my_output.csv`
+3. Evaluate `python evaluation/run_evaluation.py *--results path/to/my_folder *--out path/to/reports_dir`
+
+with *-- are flagged the optional arguments that you can pass
+
+</br>
+
 # Team Notes — Ball Possession Models
 
 ## Ideas of models
