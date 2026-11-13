@@ -1,0 +1,37 @@
+{
+ "note": "Best HMM parameters from pipeline/tune_hmm.py round 2 (tuned on degraded DFL matches, never on the competition ground truth). Use: python starter/tested_models/HMM.py --params pipeline/hmm_params_v2.json",
+ "ref_seconds": 3.0,
+ "heldout_dfl": {
+  "HMM defaults": {
+   "spell_f1": 0.20394912985274435,
+   "macro_f1": 0.6481389812055924
+  },
+  "HMM tuned": {
+   "spell_f1": 0.5419137601491659,
+   "macro_f1": 0.7998823213921843
+  },
+  "smooth50 baseline": {
+   "spell_f1": 0.27853245837122803,
+   "macro_f1": 0.5968938693239099
+  }
+ },
+ "best_params": {
+  "SECONDS_BETWEEN_SWITCHES": 133.292666697559,
+  "SECONDS_BETWEEN_STOPS": 32.850419636387215,
+  "SECONDS_OF_DEAD_BALL": 20.426413975993366,
+  "CLOSER_SLOPE": 0.21608971157321638,
+  "LOOSE_BALL_DISTANCE": 1.5956126245985938,
+  "STILL_SPEED": 1.5847661049720476,
+  "STILL_FRAMES": 38,
+  "D_LOGLIK_STRONG": 0.6560103596270711,
+  "D_LOGLIK_STILL": 0.0,
+  "D_LOGLIK_PLAY": -0.9509219391448193,
+  "D_LOGLIK_MISSING": 1.1063930899235725,
+  "FLIGHT_SPEED": 16.22581295402477,
+  "FLIGHT_DISTANCE": 2.059131176721471,
+  "AMBIGUOUS_LLR": 0.3489501314985489,
+  "MIN_DEAD_SECONDS": 6.531005839895062,
+  "USE_FLIGHT": 0,
+  "USE_AMBIGUOUS": 0
+ }
+}

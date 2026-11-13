@@ -26,6 +26,7 @@ Known weaknesses, deliberately left as openings:
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -73,10 +74,10 @@ FLIGHT_DISTANCE = 3.0       # m: nearest player is farther than this
 # the two teams: 0.3 is roughly a 43/57 split.
 AMBIGUOUS_LLR = 0.3
 # Transitions, as expected seconds between changes -> per-frame switch probability.
-SECONDS_BETWEEN_SWITCHES = 12.0   # H<->A: possessions last ~14 s in the public sample, but
+SECONDS_BETWEEN_SWITCHES = 16.9   # H<->A: possessions last ~14 s in the public sample, but
                                   # check the full-match number is NOT published; this is a prior
-SECONDS_BETWEEN_STOPS = 40.0      # live -> dead
-SECONDS_OF_DEAD_BALL = 10.0       # dead -> live
+SECONDS_BETWEEN_STOPS = 36.2      # live -> dead
+SECONDS_OF_DEAD_BALL = 20.1       # dead -> live
 
 
 def read_features(raw_path, team_of_track, n_frames, pitch):
@@ -278,16 +279,36 @@ if __name__ == '__main__':
                         help="D runs shorter than this are replaced by the previous label (0 = off)")
     parser.add_argument("--keep-ambiguous-as-d", action="store_true",
                         help="do not turn D frames with a coin-flip team evidence into X")
+    parser.add_argument("--params",
+                        help="JSON written by pipeline/tune_hmm.py (uses its 'best_params'). Sets every "
+                             "tuned constant, the switch time, --min-dead-seconds and the two --keep-* "
+                             "flags; those CLI options are then ignored.")
+    parser.add_argument("--name", help="output file name (without .csv); default hmm_switch<seconds>")
     args = parser.parse_args()
+
+    use_flight, use_ambiguous = not args.keep_flight_as_d, not args.keep_ambiguous_as_d
+    min_dead_seconds = args.min_dead_seconds
+    if args.params:
+        with open(args.params) as handle:
+            tuned = json.load(handle)
+        tuned = tuned.get("best_params", tuned)
+        # Same assignment pipeline/tune_hmm.py makes before scoring, so the result is identical.
+        for key, value in tuned.items():
+            if key in globals() and key.isupper():
+                globals()[key] = value
+        args.switch_seconds = [tuned["SECONDS_BETWEEN_SWITCHES"]]
+        min_dead_seconds = tuned["MIN_DEAD_SECONDS"]
+        use_flight, use_ambiguous = bool(tuned["USE_FLIGHT"]), bool(tuned["USE_AMBIGUOUS"])
+        print("parameters from", args.params)
 
     ll, flight, ambiguous = build()
     blocks = half_video_blocks(GAME)
     for seconds in args.switch_seconds:
         labels = decode_graded(ll, blocks, transition_matrix(seconds),
-                                None if args.keep_flight_as_d else flight,
-                                None if args.keep_ambiguous_as_d else ambiguous,
-                                int(round(args.min_dead_seconds * FPS)))
-        name = "hmm_switch{:g}".format(seconds)
+                                flight if use_flight else None,
+                                ambiguous if use_ambiguous else None,
+                                int(round(min_dead_seconds * FPS)))
+        name = args.name or "hmm_switch{:g}".format(seconds)
         path = write_submission(os.path.join(args.out, name + ".csv"), labels)
 
         graded = labels != "X"

@@ -13,3 +13,6 @@ matplotlib
 
 # For the notebooks in starter/
 notebook
+
+#For lightgbm
+lightgbm
