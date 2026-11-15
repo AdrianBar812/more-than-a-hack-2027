@@ -24,6 +24,32 @@ python pipeline/tune_hmm.py --random 200 --refine 300 --seed 1 --init <previous 
 ```
 Everything under `data/` is gitignored. The tuned HMM parameters that we ship are in `pipeline/hmm_params_v2.json`.
 
+### LightGBM: train, decode, and test on the public window
+Install the pinned versions first: `pip install -r requirements-pipeline.txt` (numpy, pandas, scipy, lightgbm; no scikit-learn needed).
+
+```bash
+# 1. Features for every degraded DFL match/seed and for the ATD (~1.7 GB cache in data/pipeline/features/, a few minutes)
+python pipeline/features.py --build
+
+# 2. Leave-one-match-out on the 7 DFL matches, decoder search, final model on all 7, decode the ATD
+python pipeline/train_lgb.py --ref-seconds 3 --out-dir data/pipeline/lgb_v2 --costs 16 20
+#    --ref-seconds 3  debounce N used for the training labels
+#    --costs SW D     fix the Viterbi costs (H<->A, live<->D). Without it, the best pair on the out-of-fold DFL is used
+#    --ensemble K     average K models (no gain measured)
+#    prints: raw-argmax and decoded out-of-fold spellF1, the top decoder settings, the top features
+#    writes: data/pipeline/lgb_v2/{lgb_decoded.csv, atd_probs.npz, oof.npz, model.txt, decoder.json}
+
+# 3. Validate the submission file (format only)
+python evaluation/validate_submission.py data/pipeline/lgb_v2/lgb_decoded.csv
+
+# 4. Test on the public ground-truth window (5 minutes, a pipeline check, never for tuning)
+mkdir -p data/pipeline/lgb_v2_eval && cp data/pipeline/lgb_v2/lgb_decoded.csv data/pipeline/lgb_v2_eval/lgb_v2.csv
+python evaluation/run_evaluation.py --results data/pipeline/lgb_v2_eval --out data/pipeline/lgb_v2_eval/report --bootstrap 1000
+```
+Quick alternative for step 4: add `--public-check` to step 2 and it prints spellF1, macroF1 and per-class F1 for the raw and decoded output (the same scorer). Run the scorer without `python -I` (it imports a sibling module). All seeds are fixed, but I have not yet checked that a fresh run reproduces `lgb_v2_sw16_d20.csv` byte for byte (multi-threaded LightGBM can differ slightly). The public window is not read unless you ask for it.
+
+Rules for using the public window: it is 5 minutes with 17 possessions (about 6 `spellF1` points per missed possession, noise about ±0.04), so use it only to confirm the pipeline works. Do not choose parameters from it. Pick decoder costs and N from the out-of-fold DFL numbers.
+
 </br>
 
 # Team Notes — Ball Possession Models
@@ -33,7 +59,7 @@ Everything under `data/` is gitignored. The tuned HMM parameters that we ship ar
 | Approach | Needs labels from other games? | Handles missing ball | spellF1 expectation | Main risk |
 |---|---|---|---|---|
 | **Heuristics + HMM/Viterbi** | No (but tuned on DFL) | Moderate, if you interpolate and use X | Above the baseline (done, see results) | Dead ball is poorly detected; parameters are weakly identified |
-| **LightGBM on window features + smoothing** | Yes (DFL) | Good, since it can learn missingness | Potentially higher | Domain gap DFL→ATD (adversarial AUC 0.84) |
+| **LightGBM on window features + Viterbi** | Yes (DFL) | Good, since it can learn missingness | Done: current best (see results) | Domain gap DFL→ATD (adversarial AUC 0.98); dead-ball recall on the real match about 0.6 |
 | **GRU / 1D-CNN / transformer + smoothing** | Yes, more of it | Good | Potentially highest | Needs the most data and tuning, and is harder to reproduce |
 
 ## Current results
@@ -44,9 +70,14 @@ Everything under `data/` is gitignored. The tuned HMM parameters that we ship ar
 |---|---|---|---|
 | `baseline_smooth50` (published floor, full match 0.2433) | 0.326 | 0.621 | 26 |
 | HMM, old defaults (`hmm_switch16.9`) | 0.231 | 0.641 | 47 |
-| **HMM, tuned on degraded DFL** (`pipeline/hmm_params_v2.json`) | **0.490** | 0.630 | 14 |
+| HMM, tuned on degraded DFL (`pipeline/hmm_params_v2.json`) | 0.490 | 0.630 | 14 |
+| LightGBM v1, decoded (switch 48 / dead 12) | 0.607 | 0.817 | 14 |
+| LightGBM v2, decoded (switch 16 / dead 48) | 0.492 | 0.842 | 9 |
+| **LightGBM v2, decoded (switch 16 / dead 20), current candidate** | **0.613** | 0.825 | 13 |
 
 On held-out DFL matches (degraded to look like the ATD): defaults 0.204, tuned 0.542, smooth50 0.279.
+LightGBM, leave-one-match-out on all 7 DFL matches (decoder 16/20): raw argmax 0.317, decoded 0.686 (per match 0.589 to 0.737, std 0.043), D recall 0.97.
+The switch 16 / dead 20 setting was chosen after seeing the v2 public-window result, so it is a disclosed judgement call and not independent evidence (see `CONTEXT.md`).
 The untuned HMM over-segments about 2.5× on both degraded DFL and the real ATD, so the degraded DFL is a reasonable proxy.
 
 ---
@@ -140,6 +171,21 @@ Caveats: the parameters are weakly identified (several settings score about the 
 
 ---
 
+## LightGBM
+
+`pipeline/features.py` (142 features, one builder for DFL and the ATD), `pipeline/train_lgb.py`.
+
+- **Features** (centred windows, offline): player-only (`p_`: centroids, spread, lines, speed, stillness at 1 / 4 / 12 s), ball where visible (`b_`, `bw_`), last-seen and next-seen ball values with their age (`bl_`, `bn_`, they bridge the 10 to 17 s ball gaps), and how much of the surrounding time the ball is visible (`v_`). Ball speed is recomputed from positions. Attack direction is inferred per half and x is mirrored, so home always attacks towards +x.
+- **Training**: leave-one-match-out on the 7 degraded DFL matches (6 matches x 3 degradation seeds, every 5th frame). Multiclass H / A / D, 300 rounds, 31 leaves, lr 0.05. Native `lightgbm.train` API.
+- **No thresholds**: the model outputs `P(H), P(A), P(D)` per frame and a Viterbi decoder picks the label path with the lowest `sum(-log p) + transition costs`. Switching H<->A costs 16 and live<->D costs 20 (nats), so a label changes only when the evidence over a stretch of frames outweighs the cost. Decoding takes the out-of-fold `spellF1` from 0.317 to 0.686.
+- **Debounce N = 3 s** for the training labels (sweep over 2 to 5 s, scored against every reference N: N=2 0.692, N=3 0.689, N=4 0.669, N=5 0.657 mean `spellF1`).
+
+What did not help (all recorded in `CONTEXT.md`): an ensemble of 3 models (0.690 vs 0.689), a bias on the D probability (best at 0 on DFL), wider decoder grids (a plateau for dead cost 32 to 80), and round 3 domain alignment (speed dead-band, relative-speed and set-piece features, adversarial pruning and weights: adversarial AUC 0.98 to 0.82, but public-window D recall 0.56 vs 0.61, so it is switched off by default: `degrade.dead_band=False`, `features.EXTRA=False`).
+
+Known weakness: dead-ball recall on the real match is about 0.6 (precision about 0.9), while on DFL out-of-fold it is 0.97. The predicted D share on the full ATD (44.7%) matches the DFL truth (44.8%), so the gap is about where D is placed or how it is labelled, not how much of it there is. Next test: a held-out dataset with real broadcast missingness (SkillCorner open data is the candidate; not yet checked).
+
+---
+
 # Additional data (DFL / IDSSE)
 
 Open dataset with 7 Bundesliga matches (match info, official events, 25 fps TRACAB positions incl. the ball):
@@ -152,7 +198,7 @@ Other games, so allowed as training/validation data under the rules. We use it t
 - **Degradation** (`pipeline/degrade.py`): DFL is converted to 0–1 coordinates and anonymous per-team slots, players get rare dropouts plus correlated "view loss" episodes, and the ball-missing mask is sampled from a model fitted on the *unlabelled* ATD (P(ball missing | player-only features)). Matches the ATD on ball-missing share (39% vs 41%), missing-run length (median 11.4 s vs 10.7 s), tracked players and player speed.
 - **Domain gap**: a classifier still separates degraded DFL from the ATD (AUC 0.84; per-match normalisation does not change it). The tells are team compactness, ball speed and the like, probably real league/tracker differences. Treat as a known gap and validate downstream.
 
-Layout of `pipeline/`: `ingest_dfl.py`, `labels.py`, `atd.py`, `player_features.py`, `degrade.py`, `check_domain.py`, `tune_hmm.py`, `hmm_params_v2.json`. More detail in `CONTEXT.md`.
+Layout of `pipeline/`: `ingest_dfl.py`, `labels.py`, `atd.py`, `player_features.py`, `degrade.py`, `check_domain.py`, `tune_hmm.py`, `hmm_params_v2.json`, `features.py`, `train_lgb.py`, `sweep_n.py`, `adversarial.py`. More detail in `CONTEXT.md`.
 
 **Credit / licence**: the DFL data is CC-BY 4.0. Credit the *Deutsche Fußball Liga (DFL)* and cite: Bassek, M., Rein, R., Weber, H., Memmert, D. (2025). *An integrated dataset of spatiotemporal and event data in elite soccer.* Scientific Data, 12(1), 195. https://doi.org/10.1038/s41597-025-04505-y
 
@@ -164,7 +210,8 @@ Layout of `pipeline/`: `ingest_dfl.py`, `labels.py`, `atd.py`, `player_features.
 - [✓] Try to improve the amount of dead balls the HMM generates (idk how atm). *Partly: tuned, but dead-ball recall is still ~25%.*
 - [✓] Calibrate/tune the HMM on other games (DFL) instead of the public window.
 - [✓] Canonical pipeline: DFL → ATD-like training data (ingest, labels, degradation, domain check).
-- [ ] Feature builder (ball-free + ball features, attack direction inferred so it works in both halves).
-- [ ] LightGBM, leave-one-match-out on DFL, scored with spellF1; then Viterbi decoding of its probabilities (HMM tuned as fallback).
-- [ ] Sweep the debounce N (2–5 s) with a fixed reference; fix one value and document it.
+- [✓] Feature builder (ball-free + ball features, attack direction inferred so it works in both halves).
+- [✓] LightGBM, leave-one-match-out on DFL, scored with spellF1; then Viterbi decoding of its probabilities (HMM tuned as fallback).
+- [✓] Sweep the debounce N (2–5 s) with a fixed reference; fix one value (N = 3) and document it.
+- [ ] Validate on a second labelled dataset with real broadcast missingness (SkillCorner open data?) to measure dead-ball recall.
 - [ ] Reproducible repo + technical document (training data: DFL, who/what/how much; possession rules; limitations).

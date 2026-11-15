@@ -111,22 +111,51 @@ def smooth_noise(shape, sigma, rng, corr_seconds=1.0):
     return (out[: shape[0]] * sigma).astype(np.float32)
 
 
-def degrade_players(players, rng, noise_m=0.05, mean_up=300.0, mean_out=2.0):
+BACKLASH_M = 0.3   # metres. Off by default: round 3 (CONTEXT.md) showed no gain on D, so v2 data is the default
+
+
+def backlash(players, d_m=BACKLASH_M):
+    """Dead-band tracker: a slot's reported position only follows the true one once it is more than
+    d_m away, so standing players report exactly 0 m/s. The ATD has 20.5% of player-frames below
+    0.6 m/s and a speed q10 of 0.2 m/s; the DFL players, degraded without this, have 13% and 0.5.
+    A fixed dead-band closes the low-speed tail (d = 0.3 m: 17.5% and 0.2) but not the mid-range
+    (the ATD median is 1.4 m/s against 1.55), which is behavioural and handled in the features.
+    """
+    out = players.copy()
+    sc = np.array([pf.LENGTH, pf.WIDTH])
+    h = players[0, :, :2] * sc
+    for t in range(len(players)):
+        p = players[t, :, :2] * sc
+        h = np.where(np.isnan(h), p, h)
+        diff = p - h
+        dist = np.hypot(diff[:, 0], diff[:, 1])
+        step = np.where((dist > d_m)[:, None], diff * (1 - d_m / np.maximum(dist, 1e-9))[:, None], 0.0)
+        h = np.where(np.isnan(p), np.nan, h + np.nan_to_num(step))
+        out[t, :, :2] = h / sc
+    return out
+
+
+def degrade_players(players, rng, team=None, noise_m=0.05, mean_up=300.0, mean_out=2.0, dead_band=False):
     """Position noise and per-slot dropout blocks (~1.4 of 22 players untracked on average)."""
     out = players.copy()
     T, S, _ = out.shape
     out[:, :, 0] += smooth_noise((T, S), noise_m / pf.LENGTH, rng, 3.0)
     out[:, :, 1] += smooth_noise((T, S), noise_m / pf.WIDTH, rng, 3.0)
+    if dead_band:
+        out = backlash(out)
     for s in range(S):
         out[~alt_runs(T, mean_up, mean_out, rng), s] = np.nan
-    return view_loss(out, rng)
+    return view_loss(out, rng, team)
 
 
-def view_loss(players, rng, mean_up=40.0, mean_out=8.0):
+def view_loss(players, rng, team=None, mean_up=40.0, mean_out=8.0):
     """Episodes where the tracker loses several players at once (camera view / far side of play).
 
     The ATD sometimes tracks only ~14 of 22 players; per-slot dropout cannot produce that. During
     an episode the k players farthest (in x) from the median tracked player are dropped each frame.
+    Each team's keeper (the player farthest from the halfway line) is protected: the ATD nearly always
+    tracks the home keeper (home defensive-third count never below 1), the extremes-first rule used to
+    drop it.
     """
     out = players.copy()
     episode = ~alt_runs(len(out), mean_up, mean_out, rng)
@@ -139,6 +168,12 @@ def view_loss(players, rng, mean_up=40.0, mean_out=8.0):
         with np.errstate(invalid="ignore"):
             d = np.abs(x - np.nanmedian(x, axis=1, keepdims=True))
         d = np.where(np.isnan(d), -1.0, d)
+        if team is not None:
+            for tm in (0, 1):
+                cols = np.flatnonzero(team == tm)
+                dev = np.where(np.isnan(x[:, cols]), -1.0, np.abs(x[:, cols] - 0.5))
+                keeper = cols[np.argmax(dev, axis=1)]
+                d[np.arange(len(seg)), keeper] = -1.0
         far = np.argsort(-d, axis=1)[:, :k]
         rows = np.repeat(np.arange(len(seg)), k)
         sub = out[seg]
@@ -177,16 +212,34 @@ def load_missing_model():
 
 
 # ---- 4. block-structured mask --------------------------------------------------------------
-def sample_ball_mask(p, rng, rate=BLOCK_RATE):
-    """True = ball missing. Two-state chain with stationary P(missing) = p[t] and cycle rate `rate`.
+# The ATD loses and re-finds the ball while it is MOVING (median ball speed 4.5 m/s when last seen and
+# 11.7 m/s when seen again, vs ~2 and ~4 for a chain that ignores the ball). The switching rates are
+# therefore scaled by g(v) = ((v + 1) / (V_REF + 1)) ** GAMMA, which leaves the stationary P(missing)
+# untouched but makes the transitions happen when the ball is fast. (GAMMA, QSCALE, BLOCK_RATE) were
+# grid-searched against the ATD's unlabelled last-seen / next-seen speed quantiles, missing share and
+# run length (best: share 0.42 vs 0.41, run mean 18.9 s vs 17.2 s, last-seen p50 4.9 vs 4.5 m/s).
+GAMMA, V_REF, QSCALE = 0.75, 5.0, 1.2
 
-    Loss rate = rate * p, regain rate = rate * (1 - p), per second. Run lengths come out
-    geometric (the ATD's are heavier tailed), which is the known approximation here.
+
+def ball_speed_ms(ball, lag=5):
+    """5-frame ball speed in m/s from a [T, 2] normalised track."""
+    x, y = ball[:, 0] * pf.LENGTH, ball[:, 1] * pf.WIDTH
+    v = np.zeros(len(ball))
+    v[lag:] = np.hypot(x[lag:] - x[:-lag], y[lag:] - y[:-lag]) * FPS / lag
+    return v
+
+
+def sample_ball_mask(p, rng, rate=BLOCK_RATE, speed=None, gamma=GAMMA, v_ref=V_REF, qscale=QSCALE):
+    """True = ball missing. Two-state chain with stationary P(missing) ~ qscale * p[t].
+
+    Loss rate = rate * q * g, regain rate = rate * (1 - q) * g, per second, with g = 1 when `speed`
+    is None. Run lengths come out geometric (the ATD's are heavier tailed): a known approximation.
     """
     T = len(p)
-    q = np.clip(p, 0.02, 0.98)
-    lose = (rate * q / FPS).astype(np.float64)
-    regain = (rate * (1 - q) / FPS).astype(np.float64)
+    q = np.clip(np.asarray(p) * (qscale if speed is not None else 1.0), 0.02, 0.98)
+    g = 1.0 if speed is None else np.clip(((np.nan_to_num(speed) + 1.0) / (v_ref + 1.0)) ** gamma, 0.05, 20.0)
+    lose = (rate * q * g / FPS).astype(np.float64)
+    regain = (rate * (1 - q) * g / FPS).astype(np.float64)
     u = rng.random(T)
     missing = np.zeros(T, dtype=bool)
     state = bool(rng.random() < q[0])
@@ -200,15 +253,33 @@ def sample_ball_mask(p, rng, rate=BLOCK_RATE):
     return missing
 
 
+# Ball tracker jitter, fitted to the UNLABELLED ATD: the DFL ball is frozen (exactly 0 m/s) while dead,
+# which a model learns as "still ball => dead", a cue the ATD ball never shows (its 25th percentile
+# of 5-frame speed is 2.4 m/s). White jitter with sigma = base + per_speed * true speed (metres)
+# fitted so the quantiles of the visible-ball speed distribution match the ATD's (plateau around
+# base 0.20-0.25 m, per_speed 0.01-0.02 m per m/s; see CONTEXT.md).
+BALL_JITTER = (0.22, 0.015)
+
+
+def ball_jitter(ball, rng, base=BALL_JITTER[0], per_speed=BALL_JITTER[1], lag=5):
+    """Add speed-dependent white jitter to a [T, 2] normalised ball track."""
+    x, y = ball[:, 0].astype(np.float64) * pf.LENGTH, ball[:, 1].astype(np.float64) * pf.WIDTH
+    v = np.zeros(len(ball))
+    v[lag:] = np.hypot(x[lag:] - x[:-lag], y[lag:] - y[:-lag]) * FPS / lag
+    sigma = base + per_speed * np.nan_to_num(v)
+    out = ball.copy()
+    out[:, 0] = (x + rng.normal(0, 1, len(x)) * sigma) / pf.LENGTH
+    out[:, 1] = (y + rng.normal(0, 1, len(y)) * sigma) / pf.WIDTH
+    return out
+
+
 def degrade_half(half, model, rng, ball_noise_m=0.05):
-    players = degrade_players(half["players"], rng)
+    players = degrade_players(half["players"], rng, half["team"])
     _, X = _feature_matrix(players, half["team"])
     p = model.predict(X)
     p = np.where(np.isnan(p), 0.4, p)
-    missing = sample_ball_mask(p, rng)
-    ball = half["ball_true"].copy()
-    ball[:, 0] += smooth_noise((len(ball),), ball_noise_m / pf.LENGTH, rng, 0.2)
-    ball[:, 1] += smooth_noise((len(ball),), ball_noise_m / pf.WIDTH, rng, 0.2)
+    ball = ball_jitter(half["ball_true"], rng)
+    missing = sample_ball_mask(p, rng, speed=ball_speed_ms(ball))
     ball[missing] = np.nan
     return dict(half, players=players, ball=ball, ball_missing=missing, p_missing=p.astype(np.float32))
 
