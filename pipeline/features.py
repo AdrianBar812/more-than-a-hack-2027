@@ -117,6 +117,9 @@ def _last_next(vis):
     return last, nxt, np.minimum(age_last, AGE_CAP), np.minimum(age_next, AGE_CAP)
 
 
+NEAR = os.environ.get("POSS_NEAR") == "1"   # idea 2: kinematics of the nearest players (set POSS_NEAR=1)
+SHORT = os.environ.get("POSS_SHORT") == "1"      # round 10: 0.5-1 s windows, ball acceleration / heading (sw_*)
+RESTART = os.environ.get("POSS_RESTART") == "1"  # round 10: per-team players around the last/next seen ball, set-piece geometry (rs_*)
 EXTRA = False   # round-3 features (CONTEXT.md): no gain on the public window, off by default
 _EXTRA_MARKS = ("rspeed", "rstill", "touch_", "gk_speed")
 
@@ -263,6 +266,92 @@ def build_features(ball, players, team, attack_right=None):
             f["s%s_%s" % (tag, k)] = arr.astype(np.float32)
             f["s%s_%s_w101" % (tag, k)] = wmean(arr, 101)
 
+    # ---------------- nearest players: kinematics relative to the ball (POSS_NEAR=1) ----------------
+    # The paper-inspired cue: whoever has the ball moves with it (low relative velocity) and the nearest
+    # opponent closes in. Per team: speed, closing speed towards the ball, speed relative to the ball and
+    # the distance of the 2nd nearest player; plus the home share and mean speed of the 5 nearest players.
+    if NEAR or SHORT:
+        lag = 5
+        vx = np.full_like(px, np.nan)
+        vy = np.full_like(py, np.nan)
+        vx[lag:] = (px[lag:] - px[:-lag]) * L * FPS / lag
+        vy[lag:] = (py[lag:] - py[:-lag]) * W * FPS / lag
+        bvx = np.full(T, np.nan)
+        bvy = np.full(T, np.nan)
+        bvx[lag:] = (bx[lag:] - bx[:-lag]) * L * FPS / lag
+        bvy[lag:] = (by[lag:] - by[:-lag]) * W * FPS / lag
+        ar = np.arange(T)
+        raw_n = {}
+        for tag, mask in (("h", home), ("a", away)):
+            sub = np.where(np.isnan(d[:, mask]), np.inf, d[:, mask])
+            idx = np.argmin(sub, axis=1)
+            nd = sub[ar, idx]
+            okn = np.isfinite(nd) & vis
+            pvx, pvy = vx[:, mask][ar, idx], vy[:, mask][ar, idx]
+            dirx = (bx - px[:, mask][ar, idx]) * L
+            diry = (by - py[:, mask][ar, idx]) * W
+            norm = np.maximum(np.hypot(dirx, diry), 0.5)
+            raw_n["spd_" + tag] = np.where(okn, np.hypot(pvx, pvy), np.nan)
+            raw_n["close_" + tag] = np.where(okn, (pvx * dirx + pvy * diry) / norm, np.nan)
+            raw_n["rel_" + tag] = np.where(okn, np.hypot(pvx - bvx, pvy - bvy), np.nan)
+            d2 = np.partition(sub, 1, axis=1)[:, 1] if sub.shape[1] > 1 else np.full(T, np.inf)
+            raw_n["d2_" + tag] = np.where(np.isfinite(d2) & vis, d2, np.nan)
+            bvn = np.maximum(np.hypot(bvx, bvy), 0.5)
+            raw_n["head_" + tag] = np.where(okn, (bvx * dirx + bvy * diry) / (bvn * norm), np.nan)
+        suball = np.where(np.isnan(d), np.inf, d)
+        idx5 = np.argpartition(suball, 4, axis=1)[:, :5]
+        d5 = np.take_along_axis(suball, idx5, axis=1)
+        ok5 = np.isfinite(d5).all(axis=1) & vis
+        raw_n["home5"] = np.where(ok5, home[idx5].mean(axis=1), np.nan)
+        raw_n["spd5"] = np.where(ok5, np.take_along_axis(np.where(np.isnan(speed), 0.0, speed), idx5, axis=1).mean(axis=1), np.nan)
+        if NEAR:
+            for k, val in raw_n.items():
+                if k.startswith("head_"):
+                    continue
+                f["nb_" + k] = val.astype(np.float32)
+                for w in (25, 101):
+                    f["nb_%s_w%d" % (k, w)] = wmean(val, w)
+        if SHORT:
+            # touches show up as ball acceleration spikes (Link & Hoernig 2017); short windows keep 3-5 s possessions visible
+            acc = np.full(T, np.nan)
+            acc[lag:] = np.hypot(bvx[lag:] - bvx[:-lag], bvy[lag:] - bvy[:-lag]) * FPS / lag
+            spike = np.where(np.isnan(acc), np.nan, (acc > 6.0).astype(np.float64))
+            sidx = np.where(spike == 1.0, np.arange(T), -10 ** 9)
+            last_spike = np.maximum.accumulate(sidx)
+            f["sw_spike_age"] = np.minimum((np.arange(T) - last_spike) / FPS, 10.0).astype(np.float32)
+            for w in (25, 51):
+                f["sw_acc_max_w%d" % w] = _wmax(acc, w)
+                f["sw_spike_rate_w%d" % w] = wmean(spike, w)
+            for k in ("spd_h", "spd_a", "close_h", "close_a", "rel_h", "rel_a", "head_h", "head_a"):
+                for w in (13, 25):
+                    f["sw_%s_w%d" % (k, w)] = wmean(raw_n[k], w)
+            for k, val in (("diff", diff), ("dmin", dmin), ("dh", dh), ("da", da), ("bvx", bvx), ("bvy_abs", np.abs(bvy))):
+                for w in (13, 25):
+                    f["sw_%s_w%d" % (k, w)] = wmean(val, w)
+
+    # ---------------- restart geometry: per-team players around the last / next seen ball (POSS_RESTART=1) ----------------
+    if RESTART:
+        for tag, ix, ok in (("l", last, last >= 0), ("n", nxt, nxt < T)):
+            ixc = np.clip(ix, 0, T - 1)
+            dd = np.where(ok[:, None], np.hypot((px - bx[ixc][:, None]) * L, (py - by[ixc][:, None]) * W), np.nan)
+            cnt = {}
+            with np.errstate(invalid="ignore"):
+                for team, mask in (("h", home), ("a", away)):
+                    sub = np.where(np.isnan(dd[:, mask]), np.inf, dd[:, mask])
+                    c5 = np.where(ok, (sub < 5.0).sum(1), np.nan).astype(np.float64)
+                    c10 = np.where(ok, (sub < 10.0).sum(1), np.nan).astype(np.float64)
+                    s10 = np.where(ok, ((sub < 10.0) & still[:, mask]).sum(1), np.nan).astype(np.float64)
+                    nearest = np.where(ok & np.isfinite(sub.min(1)), sub.min(1), np.nan)
+                    cnt[team] = (c5, c10)
+                    for k, arr in (("c5", c5), ("c10", c10), ("s10", s10), ("near", nearest)):
+                        f["rs_%s_%s_%s" % (tag, team, k)] = arr.astype(np.float32)
+                        f["rs_%s_%s_%s_w101" % (tag, team, k)] = wmean(arr, 101)
+                f["rs_%s_diff10" % tag] = (cnt["h"][1] - cnt["a"][1]).astype(np.float32)
+                f["rs_%s_diff5" % tag] = (cnt["h"][0] - cnt["a"][0]).astype(np.float32)
+            bxs, bys = bx[ixc], by[ixc]
+            f["rs_%s_touch" % tag] = np.where(ok, (0.5 - np.abs(bys - 0.5)) * W, np.nan).astype(np.float32)
+            f["rs_%s_goal" % tag] = np.where(ok, np.minimum(bxs, 1 - bxs) * L, np.nan).astype(np.float32)
+
     # ---------------- visibility ----------------
     for w in VIS_WINDOWS:
         f["v_frac_w%d" % w] = wmean(vis.astype(np.float64), w)
@@ -288,7 +377,7 @@ def _wmax(x, win):
 # ---------------------------------------------------------------------------------------------
 # Cache: python pipeline/features.py --build
 # ---------------------------------------------------------------------------------------------
-FEAT_DIR = os.path.join(os.path.dirname(HERE), "data", "pipeline", "features")
+FEAT_DIR = os.environ.get("POSS_FEAT_DIR") or os.path.join(os.path.dirname(HERE), "data", "pipeline", "features")
 
 
 def build_all(seeds=3):

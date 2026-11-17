@@ -35,6 +35,7 @@ python pipeline/features.py --build
 python pipeline/train_lgb.py --ref-seconds 3 --out-dir data/pipeline/lgb_v2 --costs 16 20
 #    --ref-seconds 3  debounce N used for the training labels
 #    --costs SW D     fix the Viterbi costs (H<->A, live<->D). Without it, the best pair on the out-of-fold DFL is used
+#    --merge-seconds  after Viterbi, merge H/A spells shorter than this into a neighbour (default 3; 0 = off)
 #    --ensemble K     average K models (no gain measured)
 #    prints: raw-argmax and decoded out-of-fold spellF1, the top decoder settings, the top features
 #    writes: data/pipeline/lgb_v2/{lgb_decoded.csv, atd_probs.npz, oof.npz, model.txt, decoder.json}
@@ -46,7 +47,7 @@ python evaluation/validate_submission.py data/pipeline/lgb_v2/lgb_decoded.csv
 mkdir -p data/pipeline/lgb_v2_eval && cp data/pipeline/lgb_v2/lgb_decoded.csv data/pipeline/lgb_v2_eval/lgb_v2.csv
 python evaluation/run_evaluation.py --results data/pipeline/lgb_v2_eval --out data/pipeline/lgb_v2_eval/report --bootstrap 1000
 ```
-Quick alternative for step 4: add `--public-check` to step 2 and it prints spellF1, macroF1 and per-class F1 for the raw and decoded output (the same scorer). Run the scorer without `python -I` (it imports a sibling module). All seeds are fixed, but I have not yet checked that a fresh run reproduces `lgb_v2_sw16_d20.csv` byte for byte (multi-threaded LightGBM can differ slightly). The public window is not read unless you ask for it.
+Quick alternative for step 4: add `--public-check` to step 2 and it prints spellF1, macroF1 and per-class F1 for the raw and decoded output (the same scorer). Run the scorer without `python -I` (it imports a sibling module). All seeds are fixed. A fresh `train_lgb.py --ref-seconds 3 --costs 16 20` run from the cached features (4.5 min, 20 threads) reproduced `lgb_v2_sw16_d20_merge3.csv` byte for byte (checked 2026-11-17; the features and degradation steps were not re-run). The public window is not read unless you ask for it.
 
 Rules for using the public window: it is 5 minutes with 17 possessions (about 6 `spellF1` points per missed possession, noise about ±0.04), so use it only to confirm the pipeline works. Do not choose parameters from it. Pick decoder costs and N from the out-of-fold DFL numbers.
 
@@ -73,10 +74,11 @@ Rules for using the public window: it is 5 minutes with 17 possessions (about 6 
 | HMM, tuned on degraded DFL (`pipeline/hmm_params_v2.json`) | 0.490 | 0.630 | 14 |
 | LightGBM v1, decoded (switch 48 / dead 12) | 0.607 | 0.817 | 14 |
 | LightGBM v2, decoded (switch 16 / dead 48) | 0.492 | 0.842 | 9 |
-| **LightGBM v2, decoded (switch 16 / dead 20), current candidate** | **0.613** | 0.825 | 13 |
+| LightGBM v2, decoded (switch 16 / dead 20) | 0.613 | 0.825 | 13 |
+| **LightGBM v2, decoded 16 / 20 + merge H/A spells under 3 s, current candidate** | **0.635** | 0.832 | 12 |
 
 On held-out DFL matches (degraded to look like the ATD): defaults 0.204, tuned 0.542, smooth50 0.279.
-LightGBM, leave-one-match-out on all 7 DFL matches (decoder 16/20): raw argmax 0.317, decoded 0.686 (per match 0.589 to 0.737, std 0.043), D recall 0.97.
+LightGBM, leave-one-match-out on all 7 DFL matches (decoder 16/20): raw argmax 0.317, decoded 0.686 (per match 0.589 to 0.737, std 0.043), D recall 0.97; with the 3 s merge 0.6945 (+0.0085 on all 7, +0.006 when the setting is chosen on the other 6 matches). Short possessions are the weak point: of true spells under 5 s only about a third are matched.
 The switch 16 / dead 20 setting was chosen after seeing the v2 public-window result, so it is a disclosed judgement call and not independent evidence (see `CONTEXT.md`).
 The untuned HMM over-segments about 2.5× on both degraded DFL and the real ATD, so the degraded DFL is a reasonable proxy.
 

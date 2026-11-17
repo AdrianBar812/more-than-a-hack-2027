@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.join(ROOT, "evaluation"))
 import labels as lab  # noqa: E402
 import possession_metrics as pm  # noqa: E402
 
-FEAT = os.path.join(ROOT, "data", "pipeline", "features")
+FEAT = os.environ.get("POSS_FEAT_DIR") or os.path.join(ROOT, "data", "pipeline", "features")
 GAP = 200
 SEEDS = (0, 1, 2)
 PARAMS = dict(objective="multiclass", num_class=3, learning_rate=0.05, num_leaves=31,
@@ -41,6 +41,33 @@ ROUNDS = 300
 STEP = 5          # train on every 5th frame (adjacent frames are near-duplicates)
 COLS = None       # feature subset (indices) set from --drop; None = all
 WEIGHTS = None    # dict "<match>_s<seed>_h<half>" -> per-row weights (adversarial density ratio), or None
+
+
+TWO_STAGE = False  # idea 1: dead-vs-live model + home-vs-away model trained on live frames only
+
+
+class TwoStage:
+    """P(D) from a binary model on all frames, P(A | live) from a binary model on live frames only.
+
+    P = [(1 - pD)(1 - pA), (1 - pD) pA, pD]. Mirrors the two-branch design of Borghesi et al. (2023),
+    whose possession loss is switched off on dead frames.
+    """
+
+    def __init__(self, m_dead, m_ha):
+        self.m_dead, self.m_ha = m_dead, m_ha
+
+    def predict(self, X):
+        pd_ = self.m_dead.predict(X)
+        pa = self.m_ha.predict(X)
+        return np.column_stack([(1 - pd_) * (1 - pa), (1 - pd_) * pa, pd_])
+
+    def feature_importance(self, kind="gain"):
+        a, b = self.m_dead.feature_importance(kind), self.m_ha.feature_importance(kind)
+        return a / max(a.sum(), 1e-9) + b / max(b.sum(), 1e-9)
+
+    def save_model(self, path):
+        self.m_dead.save_model(path.replace(".txt", "_dead.txt"))
+        self.m_ha.save_model(path.replace(".txt", "_ha.txt"))
 
 
 def sel(X):
@@ -87,6 +114,14 @@ class Ensemble:
 def fit(ms, ref, names, ensemble=1):
     import lightgbm as lgb
     models = []
+    if TWO_STAGE:
+        X, y, w = train_set(ms, ref)
+        prm = dict(PARAMS, objective="binary")
+        prm.pop("num_class")
+        md = lgb.train(prm, lgb.Dataset(X, (y == 2).astype(int), weight=w, feature_name=names), ROUNDS)
+        live = y < 2
+        mh = lgb.train(prm, lgb.Dataset(X[live], (y[live] == 1).astype(int), weight=None if w is None else w[live], feature_name=names), ROUNDS)
+        return TwoStage(md, mh)
     for j in range(ensemble):
         X, y, w = train_set(ms, ref, offset=j % STEP)
         prm = dict(PARAMS, seed=j, bagging_seed=j, feature_fraction_seed=j)
@@ -113,6 +148,15 @@ def viterbi(logp, c_sw, c_d):
     return path
 
 
+MERGE_S = 3.0      # merge decoded H/A spells shorter than this into a neighbour (round 8: +0.006 out of fold)
+
+
+def decode(p, c_sw, c_d):
+    """Viterbi over -log p, then merge H/A spells shorter than MERGE_S seconds (labels.debounce)."""
+    path = viterbi(p, c_sw, c_d)
+    return lab.debounce(path, MERGE_S).astype(np.int8) if MERGE_S > 0 else path
+
+
 def combine(halves):
     """Concatenate halves with an unscored gap -> (array, blocks)."""
     parts, blocks, pos = [], [], 0
@@ -134,7 +178,7 @@ def _task(args):
     pred = np.full(len(gt), pm.X, dtype=np.int8)
     for _h, a, e in blocks:
         p = probs[a:e + 1]
-        pred[a:e + 1] = p.argmax(1) if mode == "raw" else viterbi(p, c_sw, c_d)
+        pred[a:e + 1] = p.argmax(1) if mode == "raw" else decode(p, c_sw, c_d)
     r = pm.evaluate(gt, pred)
     return r["spell_f1_mean"], r["macro_f1"], r["n_pred_spells"], r["n_gt_spells"]
 
@@ -145,17 +189,32 @@ def main():
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "data", "pipeline", "lgb_v1"))
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--ensemble", type=int, default=1, help="number of models averaged")
+    ap.add_argument("--groups", default="", help="extra feature groups to use from the cache: near,short,restart (comma separated)")
+    ap.add_argument("--exclude", default="", help="comma separated feature-name prefixes to drop (e.g. sw_acc,sw_spike)")
+    ap.add_argument("--merge-seconds", type=float, default=3.0,
+                    help="merge decoded H/A spells shorter than this (0 = off; the v2 candidate without it used 0)")
     ap.add_argument("--costs", type=float, nargs=2, metavar=("SWITCH", "DEAD"),
                     help="use these decoder costs instead of the out-of-fold best (the v2 candidate used 16 20)")
+    ap.add_argument("--two-stage", action="store_true", help="idea 1: separate dead-vs-live and home-vs-away models")
     ap.add_argument("--drop", type=int, default=0, help="drop the first K features of data/pipeline/prune.json")
     ap.add_argument("--adv-weights", action="store_true", help="weight DFL rows by the adversarial density ratio")
     ap.add_argument("--public-check", action="store_true",
                     help="score the decoded ATD output on the public window (pipeline check only)")
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
-    global COLS, WEIGHTS
+    global COLS, WEIGHTS, TWO_STAGE, MERGE_S
+    TWO_STAGE = args.two_stage
+    MERGE_S = args.merge_seconds
     all_names = json.load(open(os.path.join(FEAT, "feature_names.json")))
     names = all_names
+    extra = {"near": "nb_", "short": "sw_", "restart": "rs_"}
+    chosen = tuple(extra[g] for g in args.groups.split(",") if g)
+    excl = tuple(x for x in args.exclude.split(",") if x)
+    keep = [i for i, n in enumerate(all_names)
+            if (not n.startswith(tuple(extra.values())) or n.startswith(chosen)) and not (excl and n.startswith(excl))]
+    if len(keep) != len(all_names):
+        COLS = keep
+        names = [all_names[i] for i in keep]
     if args.drop:
         gone = set(json.load(open(os.path.join(ROOT, "data", "pipeline", "prune.json")))["order"][:args.drop])
         COLS = [i for i, n in enumerate(all_names) if n not in gone]
@@ -216,7 +275,7 @@ def main():
         p = model.predict(sel(a["X%d" % h]))
         s = int(a["start%d" % h])
         probs_atd["P%d" % h], probs_atd["start%d" % h] = p, s
-        codes[s:s + len(p)] = viterbi(p, c_sw, c_d)
+        codes[s:s + len(p)] = decode(p, c_sw, c_d)
         raw_codes[s:s + len(p)] = p.argmax(1)
     np.savez(os.path.join(args.out_dir, "atd_probs.npz"), **probs_atd)
     letters = np.array(list("HADX"))[codes]
